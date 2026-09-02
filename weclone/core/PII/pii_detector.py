@@ -1,9 +1,10 @@
+import os
 from dataclasses import dataclass
 from typing import List, Optional, cast
 
 from presidio_analyzer import AnalyzerEngine, BatchAnalyzerEngine, Pattern, PatternRecognizer
 from presidio_analyzer.nlp_engine import NlpEngineProvider
-from presidio_anonymizer import AnonymizerEngine
+from presidio_anonymizer import AnonymizerEngine, OperatorConfig
 from presidio_anonymizer.entities.engine.recognizer_result import (
     RecognizerResult as AnonymizerRecognizerResult,  # type: ignore
 )
@@ -30,6 +31,14 @@ class PIIDetector:
 
         self._init_engines()
         self.anonymizer = AnonymizerEngine()
+        self.anonymize_operators = {
+            "PHONE_NUMBER": OperatorConfig("replace", {"new_value": "【电话号码】"}),
+            "EMAIL": OperatorConfig("replace", {"new_value": "【邮箱】"}),
+            "ID": OperatorConfig("replace", {"new_value": "【证件号】"}),
+            "NUMERIC_ID": OperatorConfig("replace", {"new_value": "【数字ID】"}),
+            "CHINESE_PII": OperatorConfig("replace", {"new_value": "【敏感信息】"}),
+            "DEFAULT": OperatorConfig("replace", {"new_value": "【敏感信息】"}),
+        }
         self.not_filtered_entities = ["DATE_TIME", "PERSON", "URL", "NRP"]
         self.supported_entities = self.get_all_entities()
         self.filtered_entities = [
@@ -69,10 +78,31 @@ class PIIDetector:
             f"Presidio engine initialized successfully, using language: {self.language}, model: {model_name}"
         )
 
+
+    def _batch_n_process(self) -> int:
+        """
+        Number of worker processes for presidio batch analysis.
+
+        Defaults to 24 (original behavior). On some container hosts, spawned
+        workers cannot initialize CUDA (cudaErrorInitializationError); in that
+        case set WECLONE_PII_N_PROCESS=1 to run detection in the main process.
+        """
+        override = os.environ.get("WECLONE_PII_N_PROCESS")
+        if override:
+            return max(1, int(override))
+        return 24
+
     def _add_custom_recognizers(self, language: str):
-        # Create numeric ID recognizer - matches 5+ digit numbers or numbers with - separators
+        # Create numeric ID recognizer - matches 7+ digit numbers or 6+ digit alphanumeric IDs.
+        # NOTE: deliberately does NOT match "2022-05-18" dates or "3-4" quantity ranges anymore,
+        # as those caused massive false positives in chat data.
         numeric_id_patterns = [
-            Pattern(name="numeric_id", regex=r"\b(?:[A-Za-z]*\d{5,}[A-Za-z]*|\d+-\d+(?:-\d+)*)\b", score=0.8),
+            Pattern(name="numeric_id", regex=r"(?<![0-9])\d{7,}(?![0-9])", score=0.8),
+            Pattern(
+                name="alphanumeric_id",
+                regex=r"(?<![A-Za-z0-9])[A-Za-z]*\d{6,}[A-Za-z]*(?![A-Za-z0-9])",
+                score=0.8,
+            ),
             Pattern(name="unicode_escape_id", regex=r"\\u[0-9a-fA-F]{4}", score=0.8),
             Pattern(name="hex_escape_id", regex=r"\\xa0", score=0.8),
         ]
@@ -176,7 +206,7 @@ class PIIDetector:
             language=self.language,
             entities=self.filtered_entities,
             score_threshold=self.threshold,
-            n_process=24,
+            n_process=self._batch_n_process(),
             batch_size=32,
         )
 
@@ -206,6 +236,56 @@ class PIIDetector:
 
         return all_pii_results
 
+    def anonymize_batch(self, texts: List[str]) -> List[str]:
+        """
+        Detect PII in multiple texts and anonymize them in place, replacing sensitive
+        spans with Chinese masks such as 【电话号码】instead of dropping whole messages.
+
+        Args:
+            texts: List of texts to anonymize
+
+        Returns:
+            List of anonymized texts, aligned with the input list. Texts without PII
+            are returned unchanged; empty texts are returned as empty strings.
+        """
+        if not texts:
+            return []
+
+        # Filter out empty or non-string texts, remember original indices for alignment
+        valid_texts = []
+        text_indices = []
+        for i, text in enumerate(texts):
+            if text and isinstance(text, str):
+                valid_texts.append(text)
+                text_indices.append(i)
+
+        anonymized_texts = [text for text in texts]
+
+        if not valid_texts:
+            return anonymized_texts
+
+        results_iterator = self.batch_analyzer.analyze_iterator(
+            texts=valid_texts,
+            language=self.language,
+            entities=self.filtered_entities,
+            score_threshold=self.threshold,
+            n_process=self._batch_n_process(),
+            batch_size=32,
+        )
+
+        for batch_idx, results in enumerate(results_iterator):
+            if not results:
+                continue
+            original_idx = text_indices[batch_idx]
+            text = valid_texts[batch_idx]
+            anonymized_texts[original_idx] = self.anonymizer.anonymize(
+                text=text,
+                analyzer_results=cast(List[AnonymizerRecognizerResult], results),
+                operators=self.anonymize_operators,
+            ).text
+
+        return anonymized_texts
+
     def anonymize_text(self, text: str, entities: Optional[List[str]] = None) -> str:
         """
         Anonymize PII information in text
@@ -226,7 +306,9 @@ class PIIDetector:
             )
 
             anonymized_result = self.anonymizer.anonymize(
-                text=text, analyzer_results=cast(List[AnonymizerRecognizerResult], analyzer_results)
+                text=text,
+                analyzer_results=cast(List[AnonymizerRecognizerResult], analyzer_results),
+                operators=self.anonymize_operators,
             )
 
             logger.info(f"Successfully anonymized {len(analyzer_results)} PII entities")
@@ -269,6 +351,7 @@ class ChinesePIIDetector(PIIDetector):
             entity
             for entity in all_entities
             if entity not in self.not_filtered_entities
+            and entity not in {"LOCATION", "ORGANIZATION", "AGE"}  # common chat content, not PII
             and not any(entity.startswith(prefix) for prefix in country_prefixes)
             and (entity in supported_entities or entity in ["NUMERIC_ID", "CHINESE_PII"])
         ]
@@ -280,13 +363,15 @@ class ChinesePIIDetector(PIIDetector):
 
         # Add Chinese-specific recognizers that are not covered by NUMERIC_ID
         chinese_patterns = [
-            Pattern(name="chinese_id_with_x", regex=r"\b\d{17}[Xx]\b", score=0.9),
+            Pattern(name="chinese_id_with_x", regex=r"(?<![A-Za-z0-9])\d{17}[Xx](?![A-Za-z0-9])", score=0.9),
             Pattern(
-                name="chinese_email", regex=r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b", score=0.9
+                name="chinese_email",
+                regex=r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9])",
+                score=0.9,
             ),
             Pattern(
                 name="chinese_email_with_plus",
-                regex=r"\b[A-Za-z0-9._%+-]+\+[A-Za-z0-9._%+-]*@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
+                regex=r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+\+[A-Za-z0-9._%+-]*@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9])",
                 score=0.95,
             ),
         ]

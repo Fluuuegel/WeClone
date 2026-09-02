@@ -185,8 +185,8 @@ def vllm_infer(
         "enable_prefix_caching": True,
     }
     if _GuidedDecodingParams is not None:
-        engine_args["guided_decoding_backend"] = "guidance"
-        engine_args["guided_decoding_disable_any_whitespace"] = True
+        # xgrammar ships with most vLLM installs; "guidance" requires an extra dependency
+        engine_args["guided_decoding_backend"] = "xgrammar"
 
     if template_obj.mm_plugin.__class__.__name__ != "BasePlugin":
         engine_args["limit_mm_per_prompt"] = {"image": 4, "video": 2, "audio": 2}

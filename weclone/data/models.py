@@ -21,6 +21,7 @@ class ChatMessage:
     room_name: Optional[str] = None  # chat room name
     is_forward: bool = False  # whether it's a forwarded message
     modality: Optional[DataModality] = None  # message modality, set in qa_generator.py
+    is_group: bool = False  # whether the message comes from a group chat
 
 
 @dataclass
@@ -44,6 +45,7 @@ class QaPair:
     messages: list[Message]
     images: list[str]
     system: str
+    group: bool = False  # whether this record comes from a group chat
 
 
 class QaPairScore(BaseModel):

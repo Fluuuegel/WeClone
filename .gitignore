@@ -198,3 +198,10 @@ models_final/*
 /llamaboard_cache
 eval_Result/*
 .claude/*
+.cursor/
+.specstory/
+.cursorindexingignore
+# ---- WeClone data pipeline outputs (generated; may contain private chat content) ----
+dataset/res_csv/sft/*.json
+dataset/res_csv/*.json
+pii_cache.pkl

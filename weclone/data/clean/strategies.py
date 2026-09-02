@@ -41,10 +41,15 @@ class CleaningStrategy(ABC):
 
         with open(dataset_info_path, "r", encoding="utf-8") as f:
             info = json.load(f)
-        paths = {
-            name: os.path.join(dataset_dir, info.get(name, {}).get("file_name"))
-            for name in [original_dataset_name, cleaned_dataset_name]
-        }
+        paths = {}
+        for name in [original_dataset_name, cleaned_dataset_name]:
+            file_name = info.get(name, {}).get("file_name")
+            if not file_name:
+                logger.error(
+                    f"Dataset '{name}' is not defined in dataset_info.json, will use original dataset."
+                )
+                return original_dataset_name
+            paths[name] = os.path.join(dataset_dir, file_name)
         original_data_path, cleaned_data_path = paths.values()
 
         try:
@@ -81,11 +86,13 @@ class LLMCleaningStrategy(CleaningStrategy):
         """
         from weclone.core.inference.offline_infer import vllm_infer
 
-        logger.info("Starting LLM scoring of data")
+        logger.info("Starting LLM scoring of group chat data")
         inputs = []
         prompt_template = PromptTemplate.from_template(CLEAN_PROMPT)
         for qa in data:
-            if qa.images:
+            if qa.images or not qa.group:
+                # Only group-chat records are scored (they are prone to semantic incoherence
+                # from multi-talker stitching); private chats and image records bypass cleaning
                 qa.score = 6
             else:
                 messages_str = ""
@@ -109,16 +116,16 @@ class LLMCleaningStrategy(CleaningStrategy):
             max_new_tokens=1024 if self.make_dataset_config.clean_dataset.llm.enable_thinking else 200,
         )
 
-        # We align scores by iterating only non-image examples and popping from the head of parsed_scores.
+        # We align scores by iterating only scored (group-chat) examples and popping from the head of parsed_scores.
         # Build an iterator over parsed results for simplicity and safety.
         parsed_iter = iter(cast(List[QaPairScore | None], parsed_scores))
-        non_image_count = 0
+        scored_count = 0
         failed_count = 0
 
         for qa in data:
-            if qa.images:
+            if qa.images or not qa.group:
                 continue
-            non_image_count += 1
+            scored_count += 1
             parsed_item = next(parsed_iter, None)
             if parsed_item is None:
                 failed_count += 1
@@ -126,12 +133,12 @@ class LLMCleaningStrategy(CleaningStrategy):
             else:
                 qa.score = parsed_item.score
 
-        # Sanity check: number of Nones should equal failed_indexs; and total length matches non-image count
+        # Sanity check: number of Nones should equal failed_indexs; and total length matches scored count
         assert failed_count == len(failed_indexs), (
             f"Mismatch: failed_count({failed_count}) != failed_indexs({len(failed_indexs)})"
         )
-        assert len(cast(List[QaPairScore | None], parsed_scores)) == non_image_count, (
-            f"Mismatch: len(parsed_scores)({len(cast(List[QaPairScore | None], parsed_scores))}) != non_image_count({non_image_count})"
+        assert len(cast(List[QaPairScore | None], parsed_scores)) == scored_count, (
+            f"Mismatch: len(parsed_scores)({len(cast(List[QaPairScore | None], parsed_scores))}) != scored_count({scored_count})"
         )
 
         scores = [qa.score for qa in data if qa.score is not None]
@@ -157,7 +164,7 @@ class OlineLLMCleaningStrategy(CleaningStrategy):
     # TODO: images clean support
     def judge(self, data: List[QaPair]) -> None:
         config = self.make_dataset_config
-        logger.info("Starting online model scoring of data")
+        logger.info("Starting online model scoring of group chat data")
         logger.info(f"Using model {config.model_name}")
 
         client = OnlineLLM(
@@ -170,7 +177,8 @@ class OlineLLMCleaningStrategy(CleaningStrategy):
         inputs = []
         prompt_template = PromptTemplate.from_template(CLEAN_PROMPT)
         for qa in data:
-            if qa.images:
+            if qa.images or not qa.group:
+                # Only group-chat records are scored; private chats and image records bypass cleaning
                 qa.score = 6
             else:
                 messages_str = ""
@@ -206,6 +214,8 @@ class OlineLLMCleaningStrategy(CleaningStrategy):
 
         score_map = {score.id: score.score for score in all_parsed_scores}
         for qa in data:
+            if qa.images or not qa.group:
+                continue
             if qa.id in score_map:
                 qa.score = score_map[qa.id]
             else:

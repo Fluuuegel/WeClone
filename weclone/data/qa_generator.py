@@ -21,6 +21,7 @@ from weclone.data.models import (
     cut_type_list,
     skip_type_list,
 )
+from weclone.data.qq_emojis import QQ_EMOJI_CODES
 from weclone.data.strategies import TimeWindowStrategy
 from weclone.data.utils import ImageToTextProcessor, check_image_file_exists
 from weclone.utils.config import load_config
@@ -116,6 +117,8 @@ class DataProcessor:
         self.c = self.config
 
         self.relations = {}
+        self.name_map: dict = {}
+        self._mention_re = None  # built by _build_nickname_map() before processing starts
 
     def main(self):
         self.pre_parse_chat_dataset()
@@ -127,6 +130,7 @@ class DataProcessor:
             sys.exit(1)
 
         csv_files = self.get_csv_files()
+        self._build_nickname_map(csv_files)
         logger.info(f"Found {len(csv_files)} CSV files in total, starting processing, please be patient...")
         message_list: List[ChatMessage] = []
         for csv_file in csv_files:
@@ -241,12 +245,15 @@ class DataProcessor:
         current_state = WAITING_INSTRUCTION
         qa_res: List[Union[QaPair, CutMessage]] = []
         last_message = None
-        current_instruction = None
+        # Accumulate consecutive instructions from the other party instead of overwriting them,
+        # so multi-message instructions (e.g. "在吗" ... "收到没") are all kept
+        current_instructions: List[ChatMessage] = []
         qa_id_counter = 0
 
         conversation_messages: List[Message] = []
         conversation_images: List[str] = []
         conversation_talker = ""
+        conversation_is_group = False
 
         def _calculate_qa_length(
             messages: List[Message], new_user_content: str, new_assistant_content: str
@@ -264,6 +271,7 @@ class DataProcessor:
             current_conversation_messages: List[Message],
             current_conversation_images: List[str],
             talker: str = "",
+            is_group: bool = False,
         ) -> int:
             """Helper function to save the current QA pair."""
             nonlocal qa_res  # Allow modification of qa_res from the outer scope
@@ -295,20 +303,29 @@ class DataProcessor:
                         system_content += f"\n 对方是你的{relation}，你们正在聊天"
 
                 processed_messages = current_conversation_messages.copy()
-                for i in range(len(processed_messages) - 1):
+                # Drop synthetic <begin_chat> instruction pairs. Injecting "你应该说：X"
+                # into the user turn teaches the model a tag-extraction shortcut instead
+                # of context-conditioned replies (a path dependency that never transfers
+                # to real inference); the subsequent natural turns are kept.
+                filtered_messages: List[Message] = []
+                i = 0
+                while i < len(processed_messages):
                     if (
                         processed_messages[i].role == "user"
                         and "<begin_chat>" in processed_messages[i].content
                         and i + 1 < len(processed_messages)
                         and processed_messages[i + 1].role == "assistant"
                     ):
-                        assistant_content = processed_messages[i + 1].content
-                        processed_messages[i] = Message(
-                            role="user",
-                            content=processed_messages[i].content.replace(
-                                "<begin_chat>", f"<begin_chat>你应该说：{assistant_content}</begin_chat>"
-                            ),
-                        )
+                        i += 2  # drop the synthetic pair
+                        continue
+                    filtered_messages.append(processed_messages[i])
+                    i += 1
+                # A leading assistant turn has no context to condition on
+                while filtered_messages and filtered_messages[0].role == "assistant":
+                    filtered_messages.pop(0)
+                if not filtered_messages:
+                    return qa_id
+                processed_messages = filtered_messages
 
                 qa_pair = self.QaPair(
                     id=qa_id,
@@ -317,6 +334,7 @@ class DataProcessor:
                     messages=processed_messages,
                     images=current_conversation_images.copy(),
                     system=system_content,
+                    group=is_group,
                 )
                 qa_res.append(qa_pair)
                 return qa_id + 1
@@ -338,14 +356,16 @@ class DataProcessor:
                         conversation_messages,
                         conversation_images,
                         conversation_talker,
+                        conversation_is_group,
                     )
                 # Reset state
                 current_state = WAITING_INSTRUCTION
-                current_instruction = None
+                current_instructions = []
                 last_message = None
                 conversation_messages = []
                 conversation_images = []
                 conversation_talker = ""
+                conversation_is_group = False
                 continue
 
             if current_state == WAITING_INSTRUCTION:
@@ -359,12 +379,14 @@ class DataProcessor:
                                 conversation_messages,
                                 conversation_images,
                                 conversation_talker,
+                                conversation_is_group,
                             )
                             conversation_messages = []
                             conversation_images = []
+                            conversation_is_group = False
 
                     # Regardless of whether a new conversation has just been started, this 'msg' now becomes the current instruction.
-                    current_instruction = msg
+                    current_instructions = [msg]
                     last_message = msg
                     conversation_talker = msg.talker
                     current_state = WAITING_RESPONSE
@@ -377,12 +399,15 @@ class DataProcessor:
                                 conversation_messages,
                                 conversation_images,
                                 conversation_talker,
+                                conversation_is_group,
                             )
                             conversation_messages = []
                             conversation_images = []
+                            conversation_is_group = False
 
                     conversation_messages.append(Message(role="user", content="<begin_chat>"))
                     conversation_messages.append(Message(role="assistant", content=msg.msg))
+                    conversation_is_group = conversation_is_group or msg.is_group
                     last_message = msg
 
             elif current_state == WAITING_RESPONSE:
@@ -395,32 +420,63 @@ class DataProcessor:
                                 conversation_messages,
                                 conversation_images,
                                 conversation_talker,
+                                conversation_is_group,
                             )
                             conversation_messages = []
                             conversation_images = []
-                    current_instruction = msg
+                            conversation_is_group = False
+                    # Accumulate instead of overwriting: consecutive messages from the other
+                    # party all become part of the pending instruction (previously the earlier
+                    # instruction was silently discarded here)
+                    current_instructions.append(msg)
                     last_message = msg
                     conversation_talker = msg.talker
                     # State remains unchanged
                 else:  # Own message - use strategy to determine if it belongs to the same conversation
                     if last_message and self.qa_match_strategy.is_same_conversation([last_message], msg):
-                        if current_instruction is None:
-                            raise ValueError("current_instruction should not be None when creating a QA pair")
+                        if not current_instructions:
+                            raise ValueError("current_instructions should not be empty when creating a QA pair")
 
-                        conversation_messages.append(Message(role="user", content=current_instruction.msg))
+                        # All accumulated instructions become one user turn
+                        instruction_content = "\n".join(instruction.msg for instruction in current_instructions)
+                        conversation_messages.append(Message(role="user", content=instruction_content))
                         conversation_messages.append(Message(role="assistant", content=msg.msg))
-                        if hasattr(current_instruction, "src") and current_instruction.src:
-                            if isinstance(current_instruction.src, list):
-                                valid_images = [img_src for img_src in current_instruction.src if img_src]
-                                if valid_images:
-                                    conversation_images.extend(valid_images)
-                            elif current_instruction.src:
-                                conversation_images.append(current_instruction.src)
+                        conversation_is_group = conversation_is_group or any(
+                            instruction.is_group for instruction in current_instructions
+                        )
+                        for current_instruction in current_instructions:
+                            if hasattr(current_instruction, "src") and current_instruction.src:
+                                if isinstance(current_instruction.src, list):
+                                    valid_images = [img_src for img_src in current_instruction.src if img_src]
+                                    if valid_images:
+                                        conversation_images.extend(valid_images)
+                                elif current_instruction.src:
+                                    conversation_images.append(current_instruction.src)
+                        last_message = msg
+                    else:
+                        # Own reply outside the time window: previously it was silently dropped and
+                        # the conversation was neither saved nor cleared. Save the conversation first,
+                        # then keep the reply as a self-initiated turn instead of losing it.
+                        if conversation_messages:
+                            qa_id_counter = _save_current_qa_pair(
+                                qa_id_counter,
+                                last_message.CreateTime if last_message else msg.CreateTime,
+                                conversation_messages,
+                                conversation_images,
+                                conversation_talker,
+                                conversation_is_group,
+                            )
+                            conversation_messages = []
+                            conversation_images = []
+                            conversation_is_group = False
+                        conversation_messages.append(Message(role="user", content="<begin_chat>"))
+                        conversation_messages.append(Message(role="assistant", content=msg.msg))
+                        conversation_is_group = conversation_is_group or msg.is_group
                         last_message = msg
 
                     # Regardless of whether it matches, reset state
                     current_state = WAITING_INSTRUCTION
-                    current_instruction = None
+                    current_instructions = []
 
         # Process the last conversation
         if conversation_messages and last_message:
@@ -430,6 +486,7 @@ class DataProcessor:
                 conversation_messages,
                 conversation_images,
                 conversation_talker,
+                conversation_is_group,
             )
 
         return qa_res
@@ -505,6 +562,7 @@ class DataProcessor:
                 CreateTime=messages[-1].CreateTime,  # Use the time of the last message
                 modality=base_msg.modality,
                 is_forward=base_msg.is_forward,
+                is_group=base_msg.is_group,
             )
 
             return combined_message
@@ -583,12 +641,127 @@ class DataProcessor:
         # elif chat_message.modality == DataModality.IMAGE:
         #     self.process_image(chat_message)
 
+    # chatlog exports inline non-text message types as bracketed placeholders in text rows
+    _pure_placeholder_re = re.compile(
+        r"^(\[(语音通话|视频通话|动画表情|QQ红包|位置|文件|位置共享|小程序|音乐|图片|链接|视频|聊天记录|卡片链接|表情|戳一戳)\])$"
+    )
+    # call records carry a duration ("[语音通话] 32:03") or a status ("[语音通话] 已取消")
+    _pure_call_re = re.compile(r"^\[(语音通话|视频通话)\](?:\s+\d{1,3}:\d{2}(?::\d{2})?|\s+已取消)?$")
+    _inline_call_re = re.compile(r"\[(语音通话|视频通话)\](?:\s+\d{1,3}:\d{2}(?::\d{2})?|\s+已取消)?")
+    _inline_placeholder_re = re.compile(r"\[(图片|视频|表情|动画表情|链接|文件|音乐|小程序|QQ红包|卡片链接|聊天记录|转发的聊天记录|语音|名片|消息|闪照|表情包|通话|Photo|Audio)\]")
+    _quote_re = re.compile(r"\[引用\s*[^：:\]]{0,30}[：:]([^\]]*)\]")
+    _control_char_re = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+    # QQ emoji text codes: /表情名 (new exports) and [表情名] (old exports) are deleted
+    _emoji_names = sorted(QQ_EMOJI_CODES, key=len, reverse=True)
+    _emoji_alt = "|".join(re.escape(name) for name in _emoji_names)
+    _slash_emoji_re = re.compile(r"/(%s)" % _emoji_alt)
+    _bracket_emoji_re = re.compile(r"\[(%s)\]" % _emoji_alt)
+
+    def clean_chat_text(self, raw: str):
+        """
+        Clean a single chat message:
+        - strips control characters (e.g. \\x14 left by group exports)
+        - drops pure-placeholder / system messages ([语音通话], 撤回了一条消息, 你已添加了...)
+        - keeps quoted-reply content but removes the quoted person's nickname (privacy)
+        - anonymizes @mentions via the global nickname map built by _build_nickname_map
+        - converts inline placeholders such as [图片] to natural Chinese (（图片）)
+
+        Returns the cleaned text, or None if the message should be dropped entirely.
+        """
+        text = self._control_char_re.sub("", raw).strip()
+        if not text:
+            return None
+        # Pure placeholders and system-generated notices carry no conversational value
+        if self._pure_placeholder_re.match(text) or self._pure_call_re.match(text):
+            return None
+        if "撤回了一条消息" in text:
+            return None
+        if text.startswith("你已添加了") and len(text) <= 40:
+            return None
+        if "以上是打招呼的消息" in text or "我通过了你的朋友验证请求" in text:
+            return None
+        if text == "微信红包":
+            return None
+        if text.startswith("[自动回复]"):
+            return None
+        if text.startswith(("[转账]", "[转账收款]")):
+            return None
+        if text.startswith("<msg>") or "<appmsg" in text:
+            # raw XML blob leaked from file/attachment messages
+            return None
+        if "你有一笔待接收的转账" in text:
+            # payment platform notice embedded in chat text
+            text = text.replace("你有一笔待接收的转账。", "").replace("你有一笔待接收的转账", "")
+        # Delete QQ emoji text codes (/呲牙, [捂脸] ...) so the model never learns
+        # to emit unrenderable slash/bracket codes instead of real emoji
+        text = self._slash_emoji_re.sub("", text)
+        text = self._bracket_emoji_re.sub("", text)
+        # Strip inline call markers ("嗯？[语音通话] 00:14" -> "嗯？")
+        text = self._inline_call_re.sub("", text)
+        # [引用 昵称：内容] -> [引用] 内容 (drop the nickname for privacy, keep replied-to content)
+        text = self._quote_re.sub(r"[引用] \1", text)
+        # @nickname -> @我 / @联系人N
+        if self._mention_re is not None:
+            text = self._mention_re.sub(lambda m: m.group(1) + self.name_map.get(m.group(2), m.group(2)), text)
+        # Inline placeholders -> natural Chinese
+        text = self._inline_placeholder_re.sub(r"（\1）", text)
+        return text.strip() or None
+
+    def _build_nickname_map(self, csv_files: List[str]) -> None:
+        """
+        Pre-scan all CSVs to collect nicknames that appear in @mentions, so that the
+        same real name is always mapped to the same pseudonym across the whole dataset.
+        Names are only collected when mentioned at least twice (avoids matching things
+        like @media in code snippets); the user's own names are mapped to "我".
+        """
+        from collections import Counter
+
+        mention_counter: "Counter[str]" = Counter()
+        self_names_counter: "Counter[str]" = Counter()
+        candidate_pattern = re.compile(r"[@＠]\s*([A-Za-z0-9_一-鿿぀-ヿ가-힯·\-]{1,24})")
+
+        for fp in csv_files:
+            try:
+                df = pd.read_csv(fp, encoding="utf-8", dtype={"msg": str, "src": str}, keep_default_na=False)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Failed to pre-scan CSV {fp}: {e}")
+                continue
+            text_mask = df["type_name"].astype(str).str.lower().isin(["文本", "text"])
+            for msg in df.loc[text_mask, "msg"]:
+                for m in candidate_pattern.finditer(str(msg)):
+                    mention_counter[m.group(1)] += 1
+            own_mask = df["is_sender"] == 1
+            for talker in df.loc[own_mask, "talker"]:
+                self_names_counter[str(talker)] += 1
+
+        self_names = {name for name, count in self_names_counter.most_common() if name and count >= 2}
+        mentioned_names = [
+            name for name, count in mention_counter.most_common() if count >= 2 and name != "全体成员"
+        ]
+
+        self.name_map: dict = {}
+        contact_index = 0
+        for name in mentioned_names:
+            if name in self_names:
+                self.name_map[name] = "我"
+            else:
+                contact_index += 1
+                self.name_map[name] = f"联系人{contact_index}"
+
+        if self.name_map:
+            alternation = "|".join(re.escape(name) for name in sorted(self.name_map, key=len, reverse=True))
+            self._mention_re = re.compile(r"([@＠])(%s)" % alternation)
+        else:
+            self._mention_re = None
+        logger.info(f"Built @mention anonymization map: {len(self.name_map)} nicknames -> pseudonyms")
+
     def load_file(self, file_path) -> List[ChatMessage]:
         """
         Perform overall first preprocessing, filter rows that don't meet conditions, check if images exist and change type to cut if not, add DataModality field
         """
         folder_path = os.path.dirname(file_path)
         folder_name = os.path.basename(folder_path)
+        is_group = folder_name.startswith("QQ群")  # chatlog export: group chat folders use the QQ群 prefix
 
         if folder_name not in self.relations:
             users_json_path = os.path.join(folder_path, "users.json")
@@ -616,26 +789,35 @@ class DataProcessor:
         if "is_forward" in df.columns:
             df = df[~((df["is_sender"] == 1) & (df["is_forward"]))]
 
-        # Batch process text messages for PII detection and blocked words
+        # Text-level cleaning: strip control chars, drop pure-placeholder/system messages,
+        # anonymize @mentions and quoted-reply nicknames
+        clean_drop_indices = []
+        for i in df.index:
+            if df.loc[i, "type_name"].lower() in ["文本", "text"]:  # type: ignore
+                cleaned = self.clean_chat_text(str(df.loc[i, "msg"]))
+                if cleaned is None:
+                    clean_drop_indices.append(i)
+                else:
+                    df.loc[i, "msg"] = cleaned
+        if clean_drop_indices:
+            df = df.drop(index=clean_drop_indices)
+
+        # Batch anonymize PII in text messages (mask sensitive spans instead of dropping
+        # whole messages, so paired Q&A data is not destroyed) and check blocked words
         text_indices = []
         text_messages = []
 
         for i in df.index:
             if df.loc[i, "type_name"].lower() in ["文本", "text"]:  # type: ignore
-                msg_str = str(df.loc[i, "msg"])
-                msg_str = msg_str.replace("\n", "")
                 text_indices.append(i)
-                text_messages.append(msg_str)
+                text_messages.append(str(df.loc[i, "msg"]))
 
-        # TODO Deleting directly by batch_has_pii returning true/false.
         indices_to_drop = []
         if text_messages:
-            pii_results = self.pii_detector.batch_has_pii(text_messages)
+            anonymized_texts = self.pii_detector.anonymize_batch(text_messages)
 
-            for idx, (df_index, msg_str, has_pii) in enumerate(zip(text_indices, text_messages, pii_results)):
-                if has_pii:
-                    indices_to_drop.append(df_index)
-                    continue
+            for df_index, msg_str, anonymized in zip(text_indices, text_messages, anonymized_texts):
+                df.loc[df_index, "msg"] = anonymized
 
                 # Check blocked words
                 for blocked_word in self.blocked_words:
@@ -643,7 +825,8 @@ class DataProcessor:
                         indices_to_drop.append(df_index)
                         break
 
-        df = df.drop(index=indices_to_drop)
+        if indices_to_drop:
+            df = df.drop(index=indices_to_drop)
 
         # Process other message types
         for i in df.index:
@@ -673,7 +856,7 @@ class DataProcessor:
         # Time format: 2021-07-07 10:27:23
         df["CreateTime"] = pd.to_datetime(df["CreateTime"])
 
-        return [ChatMessage(**row) for row in df.to_dict("records")]  # type: ignore
+        return [ChatMessage(**row, is_group=is_group) for row in df.to_dict("records")]  # type: ignore
 
     def process_text(self, chat_message: ChatMessage):
         pass
@@ -694,6 +877,7 @@ class DataProcessor:
                 "messages": [{"role": msg.role, "content": msg.content} for msg in item.messages],
                 "images": item.images,
                 "system": item.system,
+                "group": item.group,
             }
             processed_qa_res.append(item_dict)
 
