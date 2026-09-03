@@ -94,3 +94,37 @@ LLMCleaningStrategy(make_dataset_config=load_config('make_dataset')).clean()
 
 - 本机（autodl）**多进程 worker 无法初始化 CUDA**（cupy/spawn 子进程报 `cudaErrorInitializationError`），影响 presidio 批量分析与 vLLM V1 EngineCore。CPU spaCy 多进程正常；transformers 路径（web-demo / server）不受影响。
 - 数据源是 QQ chatlog 时，`cut_type_list`/`skip_type_list` 的 type_name 过滤不生效，所有非文本消息都要靠 `clean_chat_text` 的文本规则处理。
+
+## 6. 追加修复（2026-09-03 下午）
+
+### 6.1 跨联系人串台 bug
+
+**根因**：`match_qa` 的 `WAITING_RESPONSE` 分支在窗口断裂（新会话）时只保存并清空 `conversation_messages`，不清空 `current_instructions`（待回复的累积指令队列），导致上一个会话/上一个文件遗留的对方消息被 `"\n".join` 进下一个会话的 user 轮。
+
+**修复**（双重保障）：
+1. 窗口断裂时 `current_instructions = [msg]`（重置而非累积），否则继续累积；
+2. `main()` 改为**按文件逐个调用 `match_qa`**（每个 CSV 一个联系人，id 计数器跨文件共享）——联系人之间的消息在结构上不可能互相串入。
+
+### 6.2 清洗规则调整
+
+- 括号统一：所有含括号的正则使用统一字符类 `_L_BR = [\[［（(]` / `_R_BR = [\]］）)]`，半角/全角的方括号、圆括号四种形态一次覆盖（占位符 `[图片]`/`（图片）`/`(图片)`/`［图片］` 均匹配）。
+- 引用：`[引用 昵称：内容]` **整体删除**（昵称只以冒号定界，容忍昵称内出现括号）；支持嵌套括号与导出截断导致的未闭合引用（删除到消息末尾）。
+- 系统邀请长句：`_system_invite_re` 专杀 `（链接） 邀请你加入群聊` / `XX参与了接龙` 等带固定后缀的系统提示（**必须先于行内占位符执行**，否则占位符先被转换导致标记失效）。
+- 链接：`https?://[^\s\\]*`（可选吞掉一个换行）删除所有 http/https 链接，含后跟空格被截断的分享链接。
+- 合并转发的聊天记录（`[转发的聊天记录]…`，第三方对话序列化文本，含他人真名/链接）整条删除。
+
+### 6.3 代码结构
+
+正则清洗从 `qa_generator.py` 迁移至 `weclone/data/clean/strategies.py` 的 `ChatTextCleaner` 类（昵称映射由 `_build_nickname_map` 收集后经 `set_mention_map()` 注入）。
+
+### 6.4 配置联动
+
+`train_sft_args.dataset` 与 `make_dataset` 共用同一个字段：必须保持 `chat-sft`（`enable_clean=true` 时训练自动切换 `chat-sft-cleaned`）。直接填 `chat-sft-cleaned` 会让 `length_cdf` 与 `clean()` 出错（已加防御：`length_cdf` 自动去掉 `-cleaned` 后缀，`clean()` 对缺失数据集名告警回退）。
+
+### 6.5 后续规则补充（2026-09-03 晚）
+
+- 分享卡片：消息开头的 `[链接]`/`[小程序]`/`[卡片链接]` + 标题正文 → 整条丢弃；句中的 `[链接]` 仍转换为 `（链接）`。
+- 付款诈骗话术：以"就可以帮我付款啦"结尾 → 整条丢弃（基于原始文本，先于 URL 删除判断）。
+- 闪照：纯占位符整条丢弃；客户端提示语"请使用新版手机QQ查看闪照。"逐句删除（保留前后用户文字）。
+- 无价值占位符 `（闪照）/（名片）/（通话）/（QQ红包）` 出现在任何位置都直接删除，不再转换保留。
+- 单元测试：`tests/test_chat_text_cleaner.py`（29 个用例，pytest）。

@@ -12,7 +12,7 @@ from pandas import Timestamp
 
 from weclone.core.PII.pii_detector import ChinesePIIDetector, PIIDetector
 from weclone.data.chat_parsers.telegram_parser import process_telegram_dataset
-from weclone.data.clean.strategies import LLMCleaningStrategy, OlineLLMCleaningStrategy
+from weclone.data.clean.strategies import ChatTextCleaner, LLMCleaningStrategy, OlineLLMCleaningStrategy
 from weclone.data.models import (
     ChatMessage,
     CutMessage,
@@ -21,7 +21,6 @@ from weclone.data.models import (
     cut_type_list,
     skip_type_list,
 )
-from weclone.data.qq_emojis import QQ_EMOJI_CODES
 from weclone.data.strategies import TimeWindowStrategy
 from weclone.data.utils import ImageToTextProcessor, check_image_file_exists
 from weclone.utils.config import load_config
@@ -117,8 +116,7 @@ class DataProcessor:
         self.c = self.config
 
         self.relations = {}
-        self.name_map: dict = {}
-        self._mention_re = None  # built by _build_nickname_map() before processing starts
+        self.text_cleaner = ChatTextCleaner()  # mention map injected by _build_nickname_map()
 
     def main(self):
         self.pre_parse_chat_dataset()
@@ -132,15 +130,18 @@ class DataProcessor:
         csv_files = self.get_csv_files()
         self._build_nickname_map(csv_files)
         logger.info(f"Found {len(csv_files)} CSV files in total, starting processing, please be patient...")
-        message_list: List[ChatMessage] = []
+        # 每个 CSV 一个联系人：按文件逐个配对，防止跨联系人串台；id 计数器共享
+        qa_pairs: List[QaPair] = []
+        qa_id_counter = 0
         for csv_file in csv_files:
             logger.debug(f"Starting to process CSV file: {csv_file}")
             chat_messages = self.load_file(csv_file)
-            message_list.extend(self.group_consecutive_messages(messages=chat_messages))
+            grouped_messages = self.group_consecutive_messages(messages=chat_messages)
+            file_qa_res, qa_id_counter = self.match_qa(messages=grouped_messages, qa_id_counter=qa_id_counter)
+            qa_pairs.extend(file_qa_res)
             # self.process_by_msgtype(chat_message)
             logger.debug(f"Processing completed: {csv_file}, loaded {len(chat_messages)} messages in total")
-        qa_res = self.match_qa(messages=message_list)
-        qa_res = [item for item in qa_res if isinstance(item, QaPair)]
+        qa_res = [item for item in qa_pairs if isinstance(item, QaPair)]
 
         if self.image_processor:
             logger.info("Starting image recognition process...")
@@ -167,11 +168,17 @@ class DataProcessor:
             python_executable = sys.executable
             script_path = os.path.join("weclone", "utils", "length_cdf.py")
 
+            # length_cdf must analyze the raw dataset that was just generated;
+            # strip any "-cleaned" suffix coming from the shared train_sft dataset field
+            cdf_dataset = self.c.dataset
+            if cdf_dataset.endswith("-cleaned"):
+                cdf_dataset = cdf_dataset[: -len("-cleaned")]
+
             command_parts = [
                 python_executable,
                 script_path,
                 f'--model_name_or_path="{self.c.model_name_or_path}"',
-                f'--dataset="{self.c.dataset}"',
+                f'--dataset="{cdf_dataset}"',
                 f'--dataset_dir="{self.c.dataset_dir}"',
                 f'--template="{self.c.template}"',
                 "--interval=512",
@@ -229,15 +236,18 @@ class DataProcessor:
         csv_files.sort(key=extract_start)
         return csv_files
 
-    def match_qa(self, messages: List[ChatMessage]) -> List[Union[QaPair, CutMessage]]:
+    def match_qa(
+        self, messages: List[ChatMessage], qa_id_counter: int = 0
+    ) -> tuple[List[Union[QaPair, CutMessage]], int]:
         """
         Match question-answer pairs
 
         Args:
-            messages: Message list
+            messages: Message list (must belong to a single contact/chat)
+            qa_id_counter: Starting id for new QA pairs
 
         Returns:
-            List[Union[QaPair, CutMessage]]: List of Q&A pairs containing instructions and outputs
+            (qa_res, next_id): List of Q&A pairs and the next free id counter
         """
         WAITING_INSTRUCTION = "waiting_instruction"
         WAITING_RESPONSE = "waiting_response"
@@ -245,10 +255,8 @@ class DataProcessor:
         current_state = WAITING_INSTRUCTION
         qa_res: List[Union[QaPair, CutMessage]] = []
         last_message = None
-        # Accumulate consecutive instructions from the other party instead of overwriting them,
-        # so multi-message instructions (e.g. "在吗" ... "收到没") are all kept
+        # 累积对方的连续消息，多条指令合并为一个 user 轮
         current_instructions: List[ChatMessage] = []
-        qa_id_counter = 0
 
         conversation_messages: List[Message] = []
         conversation_images: List[str] = []
@@ -303,10 +311,7 @@ class DataProcessor:
                         system_content += f"\n 对方是你的{relation}，你们正在聊天"
 
                 processed_messages = current_conversation_messages.copy()
-                # Drop synthetic <begin_chat> instruction pairs. Injecting "你应该说：X"
-                # into the user turn teaches the model a tag-extraction shortcut instead
-                # of context-conditioned replies (a path dependency that never transfers
-                # to real inference); the subsequent natural turns are kept.
+                # 删除 <begin_chat> 合成指令对（避免模型学 tag 提取捷径），保留后续自然轮次
                 filtered_messages: List[Message] = []
                 i = 0
                 while i < len(processed_messages):
@@ -425,10 +430,10 @@ class DataProcessor:
                             conversation_messages = []
                             conversation_images = []
                             conversation_is_group = False
-                    # Accumulate instead of overwriting: consecutive messages from the other
-                    # party all become part of the pending instruction (previously the earlier
-                    # instruction was silently discarded here)
-                    current_instructions.append(msg)
+                        # 窗口断裂 = 新会话：重置指令队列，避免上一个会话的消息串入
+                        current_instructions = [msg]
+                    else:
+                        current_instructions.append(msg)
                     last_message = msg
                     conversation_talker = msg.talker
                     # State remains unchanged
@@ -454,9 +459,7 @@ class DataProcessor:
                                     conversation_images.append(current_instruction.src)
                         last_message = msg
                     else:
-                        # Own reply outside the time window: previously it was silently dropped and
-                        # the conversation was neither saved nor cleared. Save the conversation first,
-                        # then keep the reply as a self-initiated turn instead of losing it.
+                        # 超窗回复：先保存旧对话，再作为 <begin_chat> 轮保留
                         if conversation_messages:
                             qa_id_counter = _save_current_qa_pair(
                                 qa_id_counter,
@@ -489,7 +492,7 @@ class DataProcessor:
                 conversation_is_group,
             )
 
-        return qa_res
+        return qa_res, qa_id_counter
 
     def group_consecutive_messages(self, messages: List[ChatMessage]) -> List[ChatMessage]:
         """
@@ -641,79 +644,8 @@ class DataProcessor:
         # elif chat_message.modality == DataModality.IMAGE:
         #     self.process_image(chat_message)
 
-    # chatlog exports inline non-text message types as bracketed placeholders in text rows
-    _pure_placeholder_re = re.compile(
-        r"^(\[(语音通话|视频通话|动画表情|QQ红包|位置|文件|位置共享|小程序|音乐|图片|链接|视频|聊天记录|卡片链接|表情|戳一戳)\])$"
-    )
-    # call records carry a duration ("[语音通话] 32:03") or a status ("[语音通话] 已取消")
-    _pure_call_re = re.compile(r"^\[(语音通话|视频通话)\](?:\s+\d{1,3}:\d{2}(?::\d{2})?|\s+已取消)?$")
-    _inline_call_re = re.compile(r"\[(语音通话|视频通话)\](?:\s+\d{1,3}:\d{2}(?::\d{2})?|\s+已取消)?")
-    _inline_placeholder_re = re.compile(r"\[(图片|视频|表情|动画表情|链接|文件|音乐|小程序|QQ红包|卡片链接|聊天记录|转发的聊天记录|语音|名片|消息|闪照|表情包|通话|Photo|Audio)\]")
-    _quote_re = re.compile(r"\[引用\s*[^：:\]]{0,30}[：:]([^\]]*)\]")
-    _control_char_re = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
-    # QQ emoji text codes: /表情名 (new exports) and [表情名] (old exports) are deleted
-    _emoji_names = sorted(QQ_EMOJI_CODES, key=len, reverse=True)
-    _emoji_alt = "|".join(re.escape(name) for name in _emoji_names)
-    _slash_emoji_re = re.compile(r"/(%s)" % _emoji_alt)
-    _bracket_emoji_re = re.compile(r"\[(%s)\]" % _emoji_alt)
-
-    def clean_chat_text(self, raw: str):
-        """
-        Clean a single chat message:
-        - strips control characters (e.g. \\x14 left by group exports)
-        - drops pure-placeholder / system messages ([语音通话], 撤回了一条消息, 你已添加了...)
-        - keeps quoted-reply content but removes the quoted person's nickname (privacy)
-        - anonymizes @mentions via the global nickname map built by _build_nickname_map
-        - converts inline placeholders such as [图片] to natural Chinese (（图片）)
-
-        Returns the cleaned text, or None if the message should be dropped entirely.
-        """
-        text = self._control_char_re.sub("", raw).strip()
-        if not text:
-            return None
-        # Pure placeholders and system-generated notices carry no conversational value
-        if self._pure_placeholder_re.match(text) or self._pure_call_re.match(text):
-            return None
-        if "撤回了一条消息" in text:
-            return None
-        if text.startswith("你已添加了") and len(text) <= 40:
-            return None
-        if "以上是打招呼的消息" in text or "我通过了你的朋友验证请求" in text:
-            return None
-        if text == "微信红包":
-            return None
-        if text.startswith("[自动回复]"):
-            return None
-        if text.startswith(("[转账]", "[转账收款]")):
-            return None
-        if text.startswith("<msg>") or "<appmsg" in text:
-            # raw XML blob leaked from file/attachment messages
-            return None
-        if "你有一笔待接收的转账" in text:
-            # payment platform notice embedded in chat text
-            text = text.replace("你有一笔待接收的转账。", "").replace("你有一笔待接收的转账", "")
-        # Delete QQ emoji text codes (/呲牙, [捂脸] ...) so the model never learns
-        # to emit unrenderable slash/bracket codes instead of real emoji
-        text = self._slash_emoji_re.sub("", text)
-        text = self._bracket_emoji_re.sub("", text)
-        # Strip inline call markers ("嗯？[语音通话] 00:14" -> "嗯？")
-        text = self._inline_call_re.sub("", text)
-        # [引用 昵称：内容] -> [引用] 内容 (drop the nickname for privacy, keep replied-to content)
-        text = self._quote_re.sub(r"[引用] \1", text)
-        # @nickname -> @我 / @联系人N
-        if self._mention_re is not None:
-            text = self._mention_re.sub(lambda m: m.group(1) + self.name_map.get(m.group(2), m.group(2)), text)
-        # Inline placeholders -> natural Chinese
-        text = self._inline_placeholder_re.sub(r"（\1）", text)
-        return text.strip() or None
-
     def _build_nickname_map(self, csv_files: List[str]) -> None:
-        """
-        Pre-scan all CSVs to collect nicknames that appear in @mentions, so that the
-        same real name is always mapped to the same pseudonym across the whole dataset.
-        Names are only collected when mentioned at least twice (avoids matching things
-        like @media in code snippets); the user's own names are mapped to "我".
-        """
+        """预扫描全部 CSV 收集 @提及昵称（≥2 次），全数据集统一映射为伪名。"""
         from collections import Counter
 
         mention_counter: "Counter[str]" = Counter()
@@ -739,21 +671,17 @@ class DataProcessor:
             name for name, count in mention_counter.most_common() if count >= 2 and name != "全体成员"
         ]
 
-        self.name_map: dict = {}
+        name_map: dict = {}
         contact_index = 0
         for name in mentioned_names:
             if name in self_names:
-                self.name_map[name] = "我"
+                name_map[name] = "我"
             else:
                 contact_index += 1
-                self.name_map[name] = f"联系人{contact_index}"
+                name_map[name] = f"联系人{contact_index}"
 
-        if self.name_map:
-            alternation = "|".join(re.escape(name) for name in sorted(self.name_map, key=len, reverse=True))
-            self._mention_re = re.compile(r"([@＠])(%s)" % alternation)
-        else:
-            self._mention_re = None
-        logger.info(f"Built @mention anonymization map: {len(self.name_map)} nicknames -> pseudonyms")
+        self.text_cleaner.set_mention_map(name_map)
+        logger.info(f"Built @mention anonymization map: {len(name_map)} nicknames -> pseudonyms")
 
     def load_file(self, file_path) -> List[ChatMessage]:
         """
@@ -761,7 +689,7 @@ class DataProcessor:
         """
         folder_path = os.path.dirname(file_path)
         folder_name = os.path.basename(folder_path)
-        is_group = folder_name.startswith("QQ群")  # chatlog export: group chat folders use the QQ群 prefix
+        is_group = folder_name.startswith("QQ群")  # chatlog 导出：QQ群 前缀文件夹为群聊
 
         if folder_name not in self.relations:
             users_json_path = os.path.join(folder_path, "users.json")
@@ -794,7 +722,7 @@ class DataProcessor:
         clean_drop_indices = []
         for i in df.index:
             if df.loc[i, "type_name"].lower() in ["文本", "text"]:  # type: ignore
-                cleaned = self.clean_chat_text(str(df.loc[i, "msg"]))
+                cleaned = self.text_cleaner.clean(str(df.loc[i, "msg"]))
                 if cleaned is None:
                     clean_drop_indices.append(i)
                 else:

@@ -1,8 +1,9 @@
 import json
 import os
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, cast
+from typing import Dict, List, Optional, cast
 
 import pandas as pd
 from langchain_core.prompts import PromptTemplate
@@ -10,9 +11,112 @@ from tqdm import tqdm
 
 from weclone.core.inference.online_infer import OnlineLLM
 from weclone.data.models import QaPair, QaPairScore, QaPairScoreWithId
+from weclone.data.qq_emojis import QQ_EMOJI_CODES
 from weclone.prompts.clean_data import CLEAN_PROMPT
 from weclone.utils.config_models import WCMakeDatasetConfig
 from weclone.utils.log import logger
+
+
+class ChatTextCleaner:
+    """Regex-based text cleaning for chatlog-exported chat messages."""
+
+    # 括号字符集：兼容中英文方括号、圆括号（_R_BR_CHARS 不带类括号，用于嵌入其他字符类）
+    _L_BR = r"[\[［（(]"
+    _R_BR = r"[\]］）)]"
+    _R_BR_CHARS = r"\]］）)"
+
+    # 纯占位符整条消息 → 丢弃（含通话时长/状态形态）
+    _pure_placeholder_re = re.compile(
+        rf"^{_L_BR}(语音通话|视频通话|动画表情|QQ红包|位置|文件|位置共享|小程序|音乐|图片|链接|视频|聊天记录|卡片链接|表情|戳一戳|闪照){_R_BR}$"
+    )
+    _pure_call_re = re.compile(rf"^{_L_BR}(语音通话|视频通话){_R_BR}(?:\s+\d{{1,3}}:\d{{2}}(?::\d{{2}})?|\s+已取消)?$")
+    _inline_call_re = re.compile(rf"{_L_BR}(语音通话|视频通话){_R_BR}(?:\s+\d{{1,3}}:\d{{2}}(?::\d{{2}})?|\s+已取消)?")
+    # 行内占位符 → 全角括号（[图片] → （图片））
+    _inline_placeholder_re = re.compile(
+        rf"{_L_BR}(图片|视频|表情|动画表情|链接|文件|音乐|小程序|卡片链接|聊天记录|转发的聊天记录|语音|消息|表情包|Photo|Audio){_R_BR}"
+    )
+    # 无转换价值的占位符：任何位置都直接删除
+    _always_delete_placeholder_re = re.compile(rf"{_L_BR}(闪照|名片|通话|QQ红包){_R_BR}")
+    # 系统长句："（链接） 邀请你加入群聊" / "XX参与了接龙"
+    _system_invite_re = re.compile(rf"{_L_BR}(链接|小程序|群聊){_R_BR}\s*(邀请你加入群聊|.*参与了接龙).*")
+    # 消息开头的分享占位符+标题 → 整条丢弃；句中的 [链接] 不受影响
+    _share_card_re = re.compile(rf"^{_L_BR}(链接|小程序|卡片链接){_R_BR}\s*\S")
+    # 付款诈骗话术：以固定短语结尾 → 整条丢弃
+    _payment_scam_re = re.compile(r"就可以帮我付款啦[\s，。！？!?.]*$")
+    # QQ 客户端闪照提示语：逐句删除，保留前后用户文字
+    _flash_photo_notice_re = re.compile(rf"{_L_BR}闪照{_R_BR}\s*请使用新版手机QQ查看闪照[。.]?\s*")
+    # 引用整体删除（末尾可选右括号覆盖嵌套 [图片]）；未闭合引用删到消息末尾
+    _quote_re = re.compile(rf"{_L_BR}引用\s*[^：:]{{0,30}}[：:][^{_R_BR_CHARS}]*{_R_BR}{_R_BR}?")
+    _quote_open_re = re.compile(rf"{_L_BR}引用\s*[^：:]{{0,30}}[：:][^{_R_BR_CHARS}]*$")
+    _auto_reply_re = re.compile(rf"^{_L_BR}自动回复{_R_BR}")
+    _transfer_re = re.compile(rf"^{_L_BR}(转账|转账收款){_R_BR}")
+    _control_char_re = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+    _url_re = re.compile(r"https?://[^\s\\]*(?:\n)?")
+    # QQ 表情代码（/呲牙、[捂脸]）：白名单命中即删除
+    _emoji_names = sorted(QQ_EMOJI_CODES, key=len, reverse=True)
+    _emoji_alt = "|".join(re.escape(name) for name in _emoji_names)
+    _slash_emoji_re = re.compile(r"/(%s)" % _emoji_alt)
+    _bracket_emoji_re = re.compile(rf"{_L_BR}(%s){_R_BR}" % _emoji_alt)
+
+    def __init__(self):
+        self.name_map: Dict[str, str] = {}
+        self._mention_re: Optional[re.Pattern] = None
+
+    def set_mention_map(self, name_map: Dict[str, str]) -> None:
+        """Install the global @mention anonymization map (name -> pseudonym)."""
+        self.name_map = name_map
+        if name_map:
+            alternation = "|".join(re.escape(name) for name in sorted(name_map, key=len, reverse=True))
+            self._mention_re = re.compile(r"([@＠])(%s)" % alternation)
+        else:
+            self._mention_re = None
+
+    def clean(self, raw: str) -> Optional[str]:
+        """清洗单条消息：返回清洗后文本；应整条丢弃的消息返回 None。"""
+        text = self._control_char_re.sub("", raw).strip()
+        if not text:
+            return None
+        # 纯占位符/系统消息：整条丢弃
+        if self._pure_placeholder_re.match(text) or self._pure_call_re.match(text):
+            return None
+        if "撤回了一条消息" in text:
+            return None
+        if "转发的聊天记录" in text:
+            return None
+        if text.startswith("你已添加了") and len(text) <= 40:
+            return None
+        if "以上是打招呼的消息" in text or "我通过了你的朋友验证请求" in text:
+            return None
+        if text == "微信红包":
+            return None
+        if self._auto_reply_re.match(text):
+            return None
+        if self._transfer_re.match(text):
+            return None
+        if text.startswith("<msg>") or "<appmsg" in text:
+            return None
+        if "你有一笔待接收的转账" in text:
+            text = text.replace("你有一笔待接收的转账。", "").replace("你有一笔待接收的转账", "")
+        # 分享卡片/付款话术：必须在 URL 删除与占位符转换之前判断
+        if self._share_card_re.match(text):
+            return None
+        if self._payment_scam_re.search(text):
+            return None
+        text = self._url_re.sub("", text)
+        text = self._slash_emoji_re.sub("", text)
+        text = self._bracket_emoji_re.sub("", text)
+        text = self._inline_call_re.sub("", text)
+        text = self._quote_re.sub("", text)
+        text = self._quote_open_re.sub("", text)
+        # 系统长句/闪照提示语/无价值占位符：必须在行内占位符转换之前执行
+        text = self._system_invite_re.sub("", text)
+        text = self._flash_photo_notice_re.sub("", text)
+        text = self._always_delete_placeholder_re.sub("", text)
+        # @昵称 → @我 / @联系人N
+        if self._mention_re is not None:
+            text = self._mention_re.sub(lambda m: m.group(1) + self.name_map.get(m.group(2), m.group(2)), text)
+        text = self._inline_placeholder_re.sub(r"（\1）", text)
+        return text.strip() or None
 
 
 @dataclass
